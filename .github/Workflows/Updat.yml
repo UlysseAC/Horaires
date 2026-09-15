@@ -1,0 +1,37 @@
+name: Mise a jour horaire
+
+on:
+  schedule:
+    # Toutes les 6 heures
+    - cron: "0 */6 * * *"
+  workflow_dispatch:   # Permet de lancer manuellement depuis GitHub
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generer le fichier ICS
+        run: python3 generate.py
+
+      - name: Commit si changement
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add horaire.ics
+          if git diff --staged --quiet; then
+            echo "Aucun changement dans l'horaire"
+          else
+            git commit -m "Mise a jour horaire $(date -u +%Y-%m-%dT%H:%M)"
+            git push
+          fi
