@@ -28,7 +28,7 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add horaire.ics
+          git add horaire.ics horaire-perso.ics
           if git diff --staged --quiet; then
             echo "Aucun changement dans l'horaire"
           else
