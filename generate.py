@@ -2,14 +2,21 @@
 """
 Genere deux fichiers .ics a partir de l'horaire ISPSO/UNIGE (farma-horaires.unige.ch) :
 
-  - horaire.ics        : horaire complet, inchange (celui que tes amis utilisent)
-  - horaire-perso.ics   : meme horaire, SANS les cours listes dans EXCLUDE_CODES
+  - horaire.ics        : horaire complet (celui que tes amis utilisent)
+  - horaire-perso.ics  : meme horaire, SANS les cours listes dans EXCLUDE_CODES
 
-Configuration : modifier les constantes ci-dessous.
+Differences avec la version precedente :
+  - l'API est interrogee semaine par semaine (comme le fait le site), au lieu
+    d'une seule requete sur ~12 mois qui peut revenir vide
+  - si l'API ne renvoie AUCUN evenement, les fichiers existants ne sont pas
+    ecrases et le script se termine en erreur (croix rouge dans GitHub Actions)
+
 Usage : python3 generate.py
 """
 
 import json
+import sys
+import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -18,21 +25,23 @@ from datetime import datetime, timedelta, timezone
 # CONFIGURATION
 # ----------------------------------------------------------------------------
 
-LEVEL = "BIOMD1"          # Ton niveau d'etude (visible dans l'URL du site)
-CODE = "all"              # Filtre code de cours cote API, "all" = tous
-ROOM = "all"              # Filtre salle, "all" = toutes
-TEACHERS = "all"          # Filtre enseignant, "all" = tous
+LEVEL = "BIOMD1"          # Ton niveau d'etude
+CODE = "all"
+ROOM = "all"
+TEACHERS = "all"
 
-# Codes de cours a exclure UNIQUEMENT dans la version personnelle
-# (le fichier horaire.ics complet, utilise par tes amis, n'est pas touche)
+# Cours exclus UNIQUEMENT dans la version perso.
+# Attention : le cours "Decouverte et conception des medicaments" apparait
+# maintenant sous le code 14H001 (avant : 14H001BM). On garde les deux.
 EXCLUDE_CODES = {
     "14HS033A",  # Carrieres Biomed - Automne
-    "14H001BM",  # Decouverte et conception des medicaments
+    "14H001",    # Decouverte et conception des medicaments
+    "14H001BM",  # Decouverte et conception des medicaments (ancienne variante)
     "14HS031",   # Health economics and clinical outcomes
 }
 
-MONTHS_BACK = 2           # Combien de mois en arriere recuperer
-MONTHS_AHEAD = 10         # Combien de mois en avant recuperer
+WEEKS_BACK = 8            # semaines passees a recuperer
+WEEKS_AHEAD = 35          # semaines futures a recuperer
 
 CALENDAR_NAME_FULL = "Horaire UNIGE"
 CALENDAR_NAME_PERSO = "Horaire UNIGE (perso)"
@@ -45,16 +54,23 @@ API = "https://farma-horaires.unige.ch/get/data"
 # ----------------------------------------------------------------------------
 
 
-def fetch_events(start, end):
-    """Interroge l'API et retourne la liste brute des evenements."""
+def zurich_offset(d):
+    """Decalage Europe/Zurich approximatif : +02:00 de fin mars a fin octobre."""
+    return "+02:00" if 3 < d.month < 10 or (d.month == 3 and d.day >= 28) \
+        or (d.month == 10 and d.day < 26) else "+01:00"
+
+
+def fetch_week(monday):
+    """Recupere les evenements d'une semaine (lundi -> lundi suivant)."""
+    nxt = monday + timedelta(days=7)
     params = {
         "levels": LEVEL,
         "code": CODE,
         "room": ROOM,
         "teachers": TEACHERS,
         "cachebuster": str(int(datetime.now().timestamp() * 1000)),
-        "start": start.strftime("%Y-%m-%dT00:00:00+02:00"),
-        "end": end.strftime("%Y-%m-%dT00:00:00+02:00"),
+        "start": monday.strftime("%Y-%m-%dT00:00:00") + zurich_offset(monday),
+        "end": nxt.strftime("%Y-%m-%dT00:00:00") + zurich_offset(nxt),
         "timeZone": "Europe/Zurich",
     }
     url = API + "?" + urllib.parse.urlencode(params)
@@ -62,12 +78,37 @@ def fetch_events(start, end):
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json",
     })
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(data, list):
+                raise ValueError(f"reponse inattendue: {str(data)[:200]}")
+            return data
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"semaine du {monday.date()} : {last_err}")
+
+
+def fetch_all():
+    today = datetime.now().date()
+    first_monday = today - timedelta(days=today.weekday()) - timedelta(weeks=WEEKS_BACK)
+    weeks = WEEKS_BACK + WEEKS_AHEAD
+    events, seen = [], set()
+    for i in range(weeks):
+        monday = first_monday + timedelta(weeks=i)
+        for ev in fetch_week(monday):
+            uid = str(ev.get("id", ""))
+            if uid and uid not in seen:
+                seen.add(uid)
+                events.append(ev)
+        time.sleep(0.2)
+    return events
 
 
 def esc(text):
-    """Echappe un texte pour le format iCalendar."""
     if text is None:
         return ""
     return (str(text)
@@ -78,7 +119,7 @@ def esc(text):
 
 
 def fold(line):
-    """Replie les lignes a 75 octets comme l'exige la RFC 5545."""
+    """Replie les lignes a 75 octets (RFC 5545)."""
     raw = line.encode("utf-8")
     if len(raw) <= 75:
         return line
@@ -95,13 +136,11 @@ def fold(line):
 
 
 def parse_dt(s):
-    """Parse une date ISO de l'API (format ...Z) en datetime UTC."""
     s = s.replace("Z", "").split(".")[0]
     return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
 
 
 def build_ics(events, calendar_name, exclude_codes=None):
-    """Construit le contenu ICS. exclude_codes: set de codes a sauter, ou None."""
     exclude_codes = exclude_codes or set()
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -126,16 +165,13 @@ def build_ics(events, calendar_name, exclude_codes=None):
 
         course = ev.get("course") or {}
         code = course.get("code") or ""
-
-        # --- filtre des cours facultatifs (version perso uniquement) ---
         if code in exclude_codes:
             continue
 
         name = course.get("name") or "Cours"
         title = f"{code} - {name}" if code else name
 
-        rooms = ev.get("rooms") or []
-        rooms = list(dict.fromkeys(r for r in rooms if r))
+        rooms = list(dict.fromkeys(r for r in (ev.get("rooms") or []) if r))
         location = ", ".join(rooms)
 
         teachers = []
@@ -181,25 +217,28 @@ def build_ics(events, calendar_name, exclude_codes=None):
     return "\r\n".join(lines) + "\r\n"
 
 
-def main():
-    today = datetime.now()
-    start = today - timedelta(days=30 * MONTHS_BACK)
-    end = today + timedelta(days=30 * MONTHS_AHEAD)
+def write(path, content):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
 
-    print(f"Recuperation : {start.date()} -> {end.date()} (niveau {LEVEL})")
-    events = fetch_events(start, end)
+
+def main():
+    print(f"Recuperation semaine par semaine (niveau {LEVEL}, "
+          f"{WEEKS_BACK} sem. passees, {WEEKS_AHEAD} sem. a venir)")
+    events = fetch_all()
     print(f"{len(events)} evenements recus")
 
-    # --- fichier complet (pour tes amis, inchange) ---
-    ics_full = build_ics(events, CALENDAR_NAME_FULL, exclude_codes=None)
-    with open(OUTPUT_FULL, "w", encoding="utf-8", newline="") as f:
-        f.write(ics_full)
+    if not events:
+        print("ERREUR : l'API n'a renvoye aucun evenement. "
+              "Les fichiers existants sont conserves.", file=sys.stderr)
+        sys.exit(1)
+
+    ics_full = build_ics(events, CALENDAR_NAME_FULL)
+    write(OUTPUT_FULL, ics_full)
     print(f"{OUTPUT_FULL} ecrit ({ics_full.count('BEGIN:VEVENT')} evenements)")
 
-    # --- fichier personnel (filtre) ---
     ics_perso = build_ics(events, CALENDAR_NAME_PERSO, exclude_codes=EXCLUDE_CODES)
-    with open(OUTPUT_PERSO, "w", encoding="utf-8", newline="") as f:
-        f.write(ics_perso)
+    write(OUTPUT_PERSO, ics_perso)
     print(f"{OUTPUT_PERSO} ecrit ({ics_perso.count('BEGIN:VEVENT')} evenements)")
 
 
